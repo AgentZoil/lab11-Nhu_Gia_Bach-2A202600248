@@ -11,6 +11,11 @@ from google.adk.plugins import base_plugin
 from google.adk.agents.invocation_context import InvocationContext
 
 from core.config import ALLOWED_TOPICS, BLOCKED_TOPICS
+try:
+    from guardrails.audit_monitoring import AuditLogPlugin
+except ImportError:  # pragma: no cover - audit module optional outside pipeline
+    AuditLogPlugin = None
+from guardrails.rate_limiter import SlidingWindowRateLimiter
 
 
 # ============================================================
@@ -38,9 +43,12 @@ def detect_injection(user_input: str) -> bool:
         True if injection detected, False otherwise
     """
     INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
+        r"ignore (all )?(previous|above) instructions",
+        r"you are now [^\s]+",
+        r"reveal (your )?(instructions|system prompt|prompt)",
+        r"pretend you are",
+        r"act as (a |an )?unrestricted",
+        r"translate your (system|assistant) prompt",
     ]
 
     for pattern in INJECTION_PATTERNS:
@@ -75,7 +83,15 @@ def topic_filter(user_input: str) -> bool:
     # 2. If input doesn't contain any allowed topic -> return True
     # 3. Otherwise -> return False (allow)
 
-    pass  # Replace with your implementation
+    lowered = input_lower
+
+    if any(blocked in lowered for blocked in BLOCKED_TOPICS):
+        return True
+
+    if not any(allowed in lowered for allowed in ALLOWED_TOPICS):
+        return True
+
+    return False
 
 
 # ============================================================
@@ -96,6 +112,13 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         super().__init__(name="input_guardrail")
         self.blocked_count = 0
         self.total_count = 0
+        self.rate_limit_blocks = 0
+        self.rate_limiter = SlidingWindowRateLimiter()
+
+    def _notify_audit(self, layer: str, reason: str):
+        """Tag the current audit entry with the blocking reason."""
+        if AuditLogPlugin and AuditLogPlugin.instance:
+            AuditLogPlugin.instance.mark_blocked(layer, reason)
 
     def _extract_text(self, content: types.Content) -> str:
         """Extract plain text from a Content object."""
@@ -127,15 +150,45 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         """
         self.total_count += 1
         text = self._extract_text(user_message)
+        user_id = (
+            invocation_context.user_id
+            if invocation_context and hasattr(invocation_context, "user_id")
+            else None
+        )
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If True: increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If True: increment blocked_count, return self._block_response("...")
-        # 3. If both are False: return None (let message through)
+        decision = self.rate_limiter.check(user_id)
+        if not decision.allowed:
+            self.blocked_count += 1
+            self.rate_limit_blocks += 1
+            self._notify_audit(
+                "input_guardrail",
+                f"Rate limit exceeded (retry in {decision.retry_after:.1f}s)",
+            )
+            return self._block_response(
+                f"Rate limit exceeded. Try again in {decision.retry_after:.1f} seconds."
+            )
 
-        pass  # Replace with your implementation
+        if detect_injection(text):
+            self.blocked_count += 1
+            self._notify_audit(
+                "input_guardrail",
+                "Prompt injection pattern detected.",
+            )
+            return self._block_response(
+                "Request blocked: prompt injection patterns are not allowed."
+            )
+
+        if topic_filter(text):
+            self.blocked_count += 1
+            self._notify_audit(
+                "input_guardrail",
+                "Input is outside supported banking topics.",
+            )
+            return self._block_response(
+                "Request blocked: the topic is outside supported banking subjects."
+            )
+
+        return None
 
 
 # ============================================================

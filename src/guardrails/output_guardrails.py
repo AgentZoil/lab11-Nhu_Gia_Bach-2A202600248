@@ -13,6 +13,10 @@ from google.adk import runners
 from google.adk.plugins import base_plugin
 
 from core.utils import chat_with_agent
+try:
+    from guardrails.audit_monitoring import AuditLogPlugin
+except ImportError:  # pragma: no cover
+    AuditLogPlugin = None
 
 
 # ============================================================
@@ -41,12 +45,12 @@ def content_filter(response: str) -> dict:
 
     # PII patterns to check
     PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+        "VN phone number": r"0\d{9,10}",
+        "Email address": r"[\w\.-]+@[\w\.-]+\.[A-Za-z]{2,}",
+        "National ID": r"\b\d{9}\b|\b\d{12}\b",
+        "API key": r"sk-[A-Za-z0-9\-]+",
+        "Password assignment": r"password\s*[:=]\s*\S+",
+        "Bearer token": r"Bearer\s+[A-Za-z0-9\._\-]+",
     }
 
     for name, pattern in PII_PATTERNS.items():
@@ -89,15 +93,19 @@ Respond with ONLY one word: SAFE or UNSAFE
 If UNSAFE, add a brief reason on the next line.
 """
 
-# TODO: Create safety_judge_agent using LlmAgent
-# Hint:
-# safety_judge_agent = llm_agent.LlmAgent(
-#     model="gemini-2.0-flash",
-#     name="safety_judge",
-#     instruction=SAFETY_JUDGE_INSTRUCTION,
-# )
+def _build_judge_agent():
+    """Create the safety judge agent once; resiliency if the model is unavailable."""
+    try:
+        return llm_agent.LlmAgent(
+            model="gemini-2.5-flash",
+            name="safety_judge",
+            instruction=SAFETY_JUDGE_INSTRUCTION,
+        )
+    except Exception:
+        return None
 
-safety_judge_agent = None  # TODO: Replace with implementation
+
+safety_judge_agent = _build_judge_agent()
 judge_runner = None
 
 
@@ -109,6 +117,7 @@ def _init_judge():
             agent=safety_judge_agent, app_name="safety_judge"
         )
 
+_init_judge()
 
 async def llm_safety_check(response_text: str) -> dict:
     """Use LLM judge to check if response is safe.
@@ -150,6 +159,10 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         self.redacted_count = 0
         self.total_count = 0
 
+    def _notify_audit(self, layer: str, reason: str) -> None:
+        if AuditLogPlugin and AuditLogPlugin.instance:
+            AuditLogPlugin.instance.mark_blocked(layer, reason)
+
     def _extract_text(self, llm_response) -> str:
         """Extract text from LLM response."""
         text = ""
@@ -172,16 +185,45 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        filter_result = content_filter(response_text)
+        if not filter_result["safe"]:
+            self.redacted_count += 1
+            self._notify_audit(
+                "output_guardrail",
+                "PII or secrets redacted before response delivery.",
+            )
+            llm_response.content = types.Content(
+                role="model",
+                parts=[
+                    types.Part.from_text(
+                        text=filter_result["redacted"],
+                    )
+                ],
+            )
 
-        return llm_response  # TODO: modify if needed
+        if self.use_llm_judge:
+            judge_result = await llm_safety_check(response_text)
+            if not judge_result.get("safe", True):
+                self.blocked_count += 1
+                self._notify_audit(
+                    "output_guardrail",
+                    f"Judge flagged response unsafe: {judge_result.get('verdict', '')}",
+                )
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[
+                        types.Part.from_text(
+                            text=textwrap.dedent(
+                                """
+                                Response blocked by safety judge:
+                                Please rephrase your question or ask something else.
+                                """
+                            ).strip()
+                        )
+                    ],
+                )
+
+        return llm_response
 
 
 # ============================================================

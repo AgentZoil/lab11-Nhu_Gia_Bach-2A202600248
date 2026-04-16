@@ -1,3 +1,4 @@
+from guardrails.audit_monitoring import AuditLogPlugin, MonitoringAlert
 from guardrails.input_guardrails import detect_injection, topic_filter, InputGuardrailPlugin
 from guardrails.output_guardrails import content_filter, llm_safety_check, OutputGuardrailPlugin
 
